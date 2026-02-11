@@ -9,6 +9,8 @@
     - [2 组状态](#2-组状态)
     - [3 历史回溯状态](#3-历史回溯状态)
   - [4 并行状态](#4-并行状态)
+  - [5 无状态转换](#5-无状态转换)
+  - [6 事件状态转换](#6-事件状态转换)
 
 
 # QT状态机
@@ -236,5 +238,174 @@ QObject::connect(&s2, &QState::entered, mbox, &QMessageBox::exec);
   machine.setInitialState(s1);
 ```
 
-* s1 设置为`ParallelStates`状态，子状态设置为默认状态，这样保证了任务内部的状态是穿行，任务之间是并行的
-* 2个按键分别复杂2个任务状态切换
+* s1 设置为`ParallelStates`状态，子状态设置为默认状态，这样保证了任务内部的状态是串行，任务之间是并行的
+* 2个按键分别代表2个任务状态切换动作，
+  * **当并行任务开始进入的时候，2个子任务都会并行进入**
+  * **并且子任务各自内部的转换都是独立**
+  * **如果有一个子任务进入退出状态，那么所有任务以及父状态都会退出**
+
+**在整个状态机框架都遵循并行语义的，所有并行操作都是独立，并且是过程都是原子性的。当然，这是宏观，看上去是并行的，实际上，所有处理流程都是串行的，因为整个状态机系统就是一个单线程**
+
+
+## 5 无状态转换
+
+在状态机框架中，转换的触发是不需要有一个明确的目标状态的，跟有目标状态不同地方在于，无状态转换不会触发任何状态变更。  
+无状态转换比较适用一下场景：
+* 需要通过触发状态处理业务，但是不能进行状态转换
+
+```C++
+    QPushButton* cleanDdirtyBtn = new QPushButton("c", this);
+    cleanDdirtyBtn->setGeometry(120, 50, 50, 50);
+    cleanDdirtyBtn->show();
+
+    QPushButton* movNotMovBtn = new QPushButton("m", this);
+    movNotMovBtn->setGeometry(120, 150, 50, 50);
+    movNotMovBtn->show();
+
+    QPushButton* midBtn = new QPushButton("mid", this);
+    midBtn->setGeometry(180, 150, 50, 50);
+    midBtn->show();
+
+    QState* root = new QState();
+    root->setObjectName("root");
+    QState* child1 = new QState();
+    child1->setObjectName("child1");
+    QState* mid = new QState();
+    mid->setObjectName("mid");
+
+    QSignalTransition* st = new QSignalTransition(midBtn, &QPushButton::clicked, root);
+
+    connect(st, &QAbstractTransition::triggered, [&](){
+        qDebug()<<"targetless transition trigger !!!!";
+    });
+
+    mid->addTransition(st);
+    root->addTransition(cleanDdirtyBtn, &QPushButton::clicked, mid);
+    child1->addTransition(movNotMovBtn, &QPushButton::clicked, root);
+
+    auto connectStateDebug = [](QState *state) {
+        QObject::connect(state, &QState::entered, [state]() {
+            qDebug() << "进入状态：" << state->objectName();
+        });
+        QObject::connect(state, &QState::exited, [state]() {
+            qDebug() << "== 退出状态：" << state->objectName();
+        });
+    };
+
+    connectStateDebug(root);
+    connectStateDebug(mid);
+    connectStateDebug(child1);
+
+    machine.addState(root);
+    machine.addState(mid);
+    machine.addState(child1);
+
+    machine.setInitialState(root);
+```
+
+* 上面代码有3种状态：root, mid, child
+* mid是无目标状态
+* 只有当前状态是mid时，无状态装欢特性才会生效
+
+## 6 事件状态转换
+
+QT的事件状态转换使用独立的事件循环，而前面的讲的信号转换，实际上就是拦截了对应的信号，并发送`QStateMachine::SignalEvent`。而如果是`QObject` event，就使用 `QStateMachine::WrappedEvent`  
+
+如果说想发送自定义事件：
+* 需要编写自定义事件类
+* 那么可以使用`QStateMachine::postEvent()`  
+
+而如何接收这些自定义事件呢？
+* 需要继承 `QAbstractTransition`
+* 重载`QAbstractTransition::eventTest()`，在该函数内进行事件判断
+
+```C++
+class StringEvent : public QEvent
+{
+public:
+    StringEvent(QString s) : QEvent(QEvent::Type(User + 1)), m_str(s){}
+
+    QString m_str;
+};
+
+class StringTranstion : public QAbstractTransition
+{
+    Q_OBJECT
+public:
+    StringTranstion(QString s) : m_str(s){}
+
+protected:
+    bool eventTest(QEvent* event) override
+    {
+        if(event && (event->type() == QEvent::User+1))
+        {
+            StringEvent* e = static_cast<StringEvent*>(event);
+
+            return e->m_str == m_str;
+        }
+
+        return false;
+    }
+    void onTransition(QEvent* event) override{}
+private:
+    QString m_str;
+};
+
+void StateMachineTest::eventTransition()
+{
+    QPushButton* rootBtn = new QPushButton("c", this);
+    rootBtn->setGeometry(120, 50, 50, 50);
+    rootBtn->show();
+
+    QPushButton* childBtn = new QPushButton("m", this);
+    childBtn->setGeometry(120, 150, 50, 50);
+    childBtn->show();
+
+    QState* root = new QState();
+    root->setObjectName("root");
+    QState* child1 = new QState();
+    child1->setObjectName("child");
+
+    StringTranstion* hello = new StringTranstion("hello");
+    hello->setTargetState(child1);
+
+    StringTranstion* world = new StringTranstion("world");
+    world->setTargetState(root);
+
+    root->addTransition(hello);
+    child1->addTransition(world);
+
+    connect(rootBtn, &QPushButton::clicked, [&](){
+        machine.postEvent(new StringEvent("hello"));
+    });
+
+    connect(childBtn, &QPushButton::clicked, [&](){
+        machine.postEvent(new StringEvent("world"));
+    });
+
+    auto connectStateDebug = [](QState *state) {
+        QObject::connect(state, &QState::entered, [state]() {
+            qDebug() << "进入状态：" << state->objectName();
+        });
+        QObject::connect(state, &QState::exited, [state]() {
+            qDebug() << "== 退出状态：" << state->objectName();
+        });
+    };
+
+    connectStateDebug(root);
+    connectStateDebug(child1);
+
+    machine.addState(root);
+    machine.addState(child1);
+
+    machine.setInitialState(root);
+}
+
+
+```
+![s5](./img/statemachine5.png)
+
+* 上面创建了一个自定义字符串事件以及一个字符串转换类
+* 当按键按下会发送一个`StringEvent`, 该事件会进入到`StringTranstion::eventTest()`中，如果函数返回 true，说明事件捕捉成功，触发状态转换
+
+
